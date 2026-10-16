@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>particle galaxy</title>
+<style>
+  html, body { margin:0; padding:0; height:100%; overflow:hidden; background:#050508; touch-action:none; }
+  #stage { position:fixed; inset:0; display:block; }
+  #begin {
+    position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    color:rgba(244,241,232,0.85); background:rgba(5,5,8,0.25);
+    font:15px/1.4 -apple-system,"Segoe UI",system-ui,sans-serif; letter-spacing:0.22em;
+    cursor:pointer; user-select:none; -webkit-user-select:none; z-index:3;
+  }
+  #begin.gone { display:none; }
+  .hint {
+    position:fixed; left:0; right:0; bottom:max(12px, env(safe-area-inset-bottom));
+    text-align:center; color:rgba(244,241,232,0.42);
+    font:12px/1.4 -apple-system,"Segoe UI",system-ui,sans-serif; letter-spacing:0.14em;
+    pointer-events:none; user-select:none; z-index:2;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div class="hint">drag to spin up the arms</div>
+<div id="begin">tap to begin</div>
+<script>
+'use strict';
+// particle galaxy
+// 3,000 particles on two spiral arms orbit a warm core, top-down with a
+// slight tilt (vertical squash 0.82). A generative space-ambient engine
+// (Web Audio only, no samples) feeds an AnalyserNode: bass breathes the
+// disk radius, the beat flashes the core and flares the arms, highs lift
+// gold sparkles above the disk. Until audio starts (and in renderers
+// with no AudioContext at all) synthetic demo energies drive the same
+// visuals, so the piece is always alive and never throws.
+
+var canvas = document.getElementById('stage');
+var ctx = canvas.getContext('2d');
+
+function viewportWH(){
+  var vv = window.visualViewport;
+  if (vv && vv.width > 0 && vv.height > 0) return [vv.width, vv.height];
+  return [window.innerWidth || 1280, window.innerHeight || 900];
+}
+function isPhone(w, h){
+  var scrMin = 0;
+  if (typeof window !== 'undefined' && window.screen && window.screen.width > 0) {
+    scrMin = Math.min(window.screen.width, window.screen.height);
+  }
+  if (scrMin > 0) return scrMin < 700;
+  return h > w * 1.15;
+}
+
+// ---------- palette ----------
+var GROUND = '#050508';
+var CORE_RGB = '244,241,232';       // warm white
+var GOLD_RGB = '255,210,62';        // sparkles
+// arm colour ramps teal #2ee6a8 -> cyan #37e6ff by radius
+
+// ---------- particle field (fixed arrays, no per-frame allocation) ----------
+var N = 3000;
+var N_DISK = 2680;                  // rest are sparkles riding above the disk
+var pRad   = new Float32Array(N);   // normalised base radius 0.05..1
+var pAng   = new Float32Array(N);   // current angle
+var pOm    = new Float32Array(N);   // Kepler-ish angular speed
+var pBoost = new Float32Array(N);   // drag-injected angular momentum
+var pSize  = new Float32Array(N);   // rect size 1..2
+var pSeed  = new Float32Array(N);   // per-particle random seed
+var pCol   = new Array(N);          // precomputed fill style (disk only)
+
+function mulberry32(a){return function(){a|=0;a=(a+0x6D2B79F5)|0;var t=Math.imul(a^(a>>>15),1|a);t=(t+Math.imul(t^(t>>>7),61|t))^t;return((t^(t>>>14))>>>0)/4294967296}}
+var rng = mulberry32(20261016);
+var SPIRAL = 2.7;                   // spiral tightness (radians of wind at r=1)
+
+for (var i = 0; i < N; i++) {
+  var spark = i >= N_DISK;
+  // radius: denser toward the core, a few stragglers at the rim
+  var rn = 0.05 + 0.95 * Math.pow(rng(), spark ? 0.9 : 0.62);
+  var arm = i % 2;
+  var jit = (rng() + rng() + rng() - 1.5) * 0.5 * (0.4 + rn);
+  pRad[i] = rn;
+  pAng[i] = arm * Math.PI + rn * SPIRAL + jit + rng() * 0.15;
+  if (spark) pAng[i] += rng() * Math.PI * 2;              // sparkles scatter over the whole disk
+  pOm[i] = (0.55 / (0.30 + rn * 1.5)) * (0.82 + rng() * 0.36);   // Kepler-ish, per-particle spread so trails break up
+  pSize[i] = spark ? (1.4 + rng() * 0.8) : (rng() < 0.72 ? 1.1 : 1.9);
+  pSeed[i] = rng();
+  if (!spark) {
+    var tr = 46 + (55 - 46) * rn, tg = 230, tb = 168 + (255 - 168) * rn;
+    var bright = 0.5 + 0.5 * rng();
+    pCol[i] = 'rgba(' + (tr|0) + ',' + tg + ',' + (tb|0) + ',' + (0.34 + 0.5 * bright).toFixed(2) + ')';
+  }
+}
+
+// ---------- audio state ----------
+var audioCtx = null, analyser = null, freqData = null;
+var audioLive = false;
+
+// ---------- visual state ----------
+var E = { bass: 0.4, mid: 0.3, high: 0.25 };   // smoothed band energies
+var flash = 0;          // core flash, 1 at the beat, decays over ~1s
+var flare = 0;          // arm flare impulse, decays over ~1s
+var patRot = 0;         // rigid rotation of the spiral arm pattern (density wave)
+var lastBeat = -10;
+var simT = 0;
+var started = false;
+
+var pointerDown = false, pointerX = 0, pointerY = 0, pointerVX = 0, pointerVY = 0, lastPX = 0, lastPY = 0;
+
+// synthetic demo energies: a slow pad swell, a beat every ~1.09s, shimmer
+function demoEnergies(t) {
+  var ph = t % 1.09;
+  var pulse = Math.exp(-ph * 5.5);
+  E.bass += ((0.34 + 0.16 * Math.sin(t * 0.6) + pulse * 0.55) - E.bass) * 0.35;
+  E.mid  += ((0.30 + 0.14 * Math.sin(t * 0.43 + 1.7)) - E.mid) * 0.2;
+  E.high += ((0.34 + 0.26 * Math.sin(t * 2.6) * Math.sin(t * 0.9 + 0.5) + 0.12 * Math.sin(t * 7.3)) - E.high) * 0.3;
+  if (E.bass > 0.8 && t - lastBeat > 0.5) { lastBeat = t; flash = 1; flare = 1; }
+}
+
+function audioEnergies() {
+  if (!analyser || !freqData) return;
+  analyser.getByteFrequencyData(freqData);
+  // fftSize 2048 at ~44.1k: bin ~21.5 Hz. bass 30-150, mid 150-2000, high 2000-10000
+  var b = 0, m = 0, h = 0, i;
+  for (i = 2; i <= 7; i++) b += freqData[i];
+  b /= 6 * 255;
+  for (i = 8; i <= 92; i++) m += freqData[i];
+  m /= 85 * 255;
+  for (i = 93; i <= 460 && i < freqData.length; i++) h += freqData[i];
+  h /= 368 * 255;
+  E.bass += (Math.min(1, b * 1.5) - E.bass) * 0.45;
+  E.mid  += (Math.min(1, m * 1.8) - E.mid) * 0.3;
+  E.high += (Math.min(1, h * 2.4) - E.high) * 0.35;
+  if (E.bass > 0.72 && simT - lastBeat > 0.42) { lastBeat = simT; flash = 1; flare = 1; }
+}
+
+// ---------- generative audio engine (Web Audio only, no samples) ----------
+function startAudio() {
+  if (audioLive) return;
+  var AC = (typeof window !== 'undefined') ? (window.AudioContext || window.webkitAudioContext) : null;
+  if (!AC) return;                                   // QA renderer: stay silent, demo visuals run
+  try {
+    audioCtx = new AC();
+    var master = audioCtx.createGain(); master.gain.value = 0.6;
+    analyser = audioCtx.createAnalyser(); analyser.fftSize = 2048; analyser.smoothingTimeConstant = 0.55;
+    freqData = new Uint8Array(analyser.frequencyBinCount);
+    var bus = audioCtx.createGain(); bus.gain.value = 1;
+    bus.connect(analyser); analyser.connect(master); master.connect(audioCtx.destination);
+    if (audioCtx.state === 'suspended' && audioCtx.resume) audioCtx.resume();
+
+    // slow minor pad: four detuned pairs through a breathing lowpass
+    var padGain = audioCtx.createGain(); padGain.gain.value = 0.055;
+    var padFilter = audioCtx.createBiquadFilter(); padFilter.type = 'lowpass'; padFilter.frequency.value = 520; padFilter.Q.value = 0.4;
+    padGain.connect(padFilter); padFilter.connect(bus);
+    var chords = [
+      [110.00, 164.81, 261.63, 329.63],   // A minor
+      [87.31, 130.81, 174.61, 220.00],    // F major
+      [98.00, 146.83, 196.00, 293.66],    // G add
+      [110.00, 164.81, 220.00, 261.63]    // A minor variant
+    ];
+    var padOsc = [];
+    for (var c = 0; c < 4; c++) {
+      for (var d = 0; d < 2; d++) {
+        var o = audioCtx.createOscillator();
+        o.type = d ? 'triangle' : 'sine';
+        o.frequency.value = chords[0][c];
+        o.detune.value = d ? 5 : -4;
+        var og = audioCtx.createGain(); og.gain.value = c < 2 ? 0.5 : 0.3;
+        o.connect(og); og.connect(padGain); o.start();
+        padOsc.push(o);
+      }
+    }
+    var lfo = audioCtx.createOscillator(); lfo.frequency.value = 0.05;
+    var lfoG = audioCtx.createGain(); lfoG.gain.value = 210;
+    lfo.connect(lfoG); lfoG.connect(padFilter.frequency); lfo.start();
+    var chordIdx = 0;
+    setInterval(function () {
+      if (!audioCtx) return;
+      chordIdx = (chordIdx + 1) % chords.length;
+      var t = audioCtx.currentTime;
+      for (var k = 0; k < padOsc.length; k++) {
+        padOsc[k].frequency.setTargetAtTime(chords[chordIdx][k >> 1], t, 3.5);
+      }
+    }, 16000);
+
+    // sub bass pulse + shimmering arp, scheduled with lookahead
+    var arpNotes = [440.00, 523.25, 659.25, 783.99, 880.00, 1046.50];
+    var delay = audioCtx.createDelay(1); delay.delayTime.value = 0.42;
+    var fb = audioCtx.createGain(); fb.gain.value = 0.36;
+    var delayOut = audioCtx.createGain(); delayOut.gain.value = 0.5;
+    delay.connect(fb); fb.connect(delay); delay.connect(delayOut); delayOut.connect(bus);
+    var step = 0, nextTime = audioCtx.currentTime + 0.1, arpPos = 2;
+    setInterval(function () {
+      if (!audioCtx) return;
+      while (nextTime < audioCtx.currentTime + 0.25) {
+        if (step % 4 === 0) {                       // the beat: sub pulse
+          var bo = audioCtx.createOscillator(); bo.type = 'sine'; bo.frequency.value = 55;
+          var bg = audioCtx.createGain();
+          bg.gain.setValueAtTime(0.0001, nextTime);
+          bg.gain.exponentialRampToValueAtTime(0.5, nextTime + 0.015);
+          bg.gain.exponentialRampToValueAtTime(0.0001, nextTime + 0.5);
+          bo.connect(bg); bg.connect(bus); bo.start(nextTime); bo.stop(nextTime + 0.55);
+        }
+        if (step % 2 === 0 && rng() < 0.78) {        // shimmer arp with long delay
+          arpPos += (rng() < 0.5 ? -1 : 1) * (1 + ((rng() * 2) | 0));
+          if (arpPos < 0) arpPos = 1; if (arpPos >= arpNotes.length) arpPos = arpNotes.length - 2;
+          var ao = audioCtx.createOscillator(); ao.type = 'sine'; ao.frequency.value = arpNotes[arpPos];
+          var ag = audioCtx.createGain();
+          ag.gain.setValueAtTime(0.0001, nextTime);
+          ag.gain.exponentialRampToValueAtTime(0.075, nextTime + 0.01);
+          ag.gain.exponentialRampToValueAtTime(0.0001, nextTime + 0.6);
+          ao.connect(ag); ag.connect(bus); ag.connect(delay);
+          ao.start(nextTime); ao.stop(nextTime + 0.65);
+        }
+        step++; nextTime += 0.2725;                 // ~110 bpm sixteenths grid
+      }
+    }, 110);
+    audioLive = true;
+  } catch (e) {
+    audioCtx = null; analyser = null; audioLive = false;   // never throw
+  }
+}
+
+// ---------- simulation ----------
+function stepSim(dt) {
+  simT += dt;
+  patRot += dt * 0.06;
+  if (audioLive) audioEnergies(); else demoEnergies(simT);
+  flash *= Math.exp(-dt * 3.2);
+  flare *= Math.exp(-dt * 2.6);
+  var breathe = 1 + E.bass * 0.10 + flare * 0.20;
+  var i, a, om;
+  for (i = 0; i < N; i++) {
+    om = pOm[i] * (0.9 + 0.25 * E.mid) + pBoost[i];
+    pAng[i] += om * dt;
+    pBoost[i] *= Math.exp(-dt * 1.1);
+  }
+  // drag: fingertip injects angular momentum into nearby particles
+  if (pointerDown) {
+    var wh = viewportWH(), w = wh[0], h = wh[1];
+    var S = Math.min(w, h), R = (isPhone(w, h) ? S * 0.47 : S * 0.425);
+    var cx = w / 2, cy = h / 2;
+    var gx = (pointerX - cx) / R, gy = (pointerY - cy) / (R * 0.82);
+    var tang = (-gy * pointerVX + gx * pointerVY);        // tangential pointer speed
+    var spin = 0.9 + Math.min(2.2, Math.abs(tang) * 1.4) * (tang < 0 ? -1 : 1);
+    if (Math.abs(tang) < 0.05) spin = 0.9;
+    for (i = 0; i < N; i++) {
+      var rr = pRad[i] * breathe;
+      var dx = Math.cos(pAng[i]) * rr - gx, dy = Math.sin(pAng[i]) * rr - gy;
+      var d2 = dx * dx + dy * dy;
+      if (d2 < 0.16) pBoost[i] += spin * (1 - d2 / 0.16) * dt * 6;
+    }
+  }
+  return breathe;
+}
+
+function drawGalaxy(breathe, fade) {
+  var wh = viewportWH(), w = wh[0], h = wh[1];
+  var dpr = Math.min((typeof window !== 'undefined' && window.devicePixelRatio) || 1, 2);
+  var bw = Math.round(w * dpr), bh = Math.round(h * dpr);
+  if (canvas.width !== bw || canvas.height !== bh) { canvas.width = bw; canvas.height = bh; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+
+  if (fade) { ctx.fillStyle = 'rgba(5,5,8,0.08)'; } else { ctx.fillStyle = GROUND; }
+  ctx.fillRect(0, 0, w, h);
+
+  var S = Math.min(w, h);
+  var R = (isPhone(w, h) ? S * 0.47 : S * 0.425);
+  var cx = w / 2, cy = h / 2, SQUASH = 0.82;
+  var sizeMul = Math.max(1, Math.min(1.8, S / 640));
+  var i, x, y, rr;
+
+  // core under-glow: layered flat circles, warm white, in fine alpha
+  // steps so no single edge reads against the ground
+  ctx.fillStyle = 'rgba(' + CORE_RGB + ',0.016)';
+  ctx.beginPath(); ctx.arc(cx, cy, R * 0.20, 0, 6.2832); ctx.fill();
+  ctx.fillStyle = 'rgba(' + CORE_RGB + ',0.022)';
+  ctx.beginPath(); ctx.arc(cx, cy, R * 0.165, 0, 6.2832); ctx.fill();
+  ctx.fillStyle = 'rgba(' + CORE_RGB + ',0.030)';
+  ctx.beginPath(); ctx.arc(cx, cy, R * 0.135, 0, 6.2832); ctx.fill();
+  ctx.fillStyle = 'rgba(' + CORE_RGB + ',0.042)';
+  ctx.beginPath(); ctx.arc(cx, cy, R * 0.11, 0, 6.2832); ctx.fill();
+  ctx.fillStyle = 'rgba(' + CORE_RGB + ',0.060)';
+  ctx.beginPath(); ctx.arc(cx, cy, R * 0.088, 0, 6.2832); ctx.fill();
+  ctx.fillStyle = 'rgba(' + CORE_RGB + ',0.090)';
+  ctx.beginPath(); ctx.arc(cx, cy, R * 0.068, 0, 6.2832); ctx.fill();
+  ctx.fillStyle = 'rgba(' + CORE_RGB + ',0.14)';
+  ctx.beginPath(); ctx.arc(cx, cy, R * 0.05, 0, 6.2832); ctx.fill();
+  ctx.fillStyle = 'rgba(' + CORE_RGB + ',0.9)';
+  ctx.beginPath(); ctx.arc(cx, cy, R * 0.036, 0, 6.2832); ctx.fill();
+
+  // disk particles. Brightness follows a rigidly rotating two-arm density
+  // wave: particles flow through the arms and light up as they cross, so
+  // the spiral never shears away under differential rotation.
+  for (i = 0; i < N_DISK; i++) {
+    rr = pRad[i] * breathe * R;
+    x = cx + Math.cos(pAng[i]) * rr;
+    y = cy + Math.sin(pAng[i]) * rr * SQUASH;
+    var u = (pAng[i] - patRot - pRad[i] * SPIRAL) % Math.PI;
+    if (u < 0) u += Math.PI;
+    var dd = Math.min(u, Math.PI - u) / (Math.PI / 2);
+    var prox = 1 - dd; prox *= prox;
+    ctx.globalAlpha = 0.30 + 0.70 * prox;
+    ctx.fillStyle = pCol[i];
+    var s = pSize[i] * sizeMul * (0.75 + 0.5 * prox);
+    ctx.fillRect(x - s / 2, y - s / 2, s, s);
+  }
+  ctx.globalAlpha = 1;
+  // sparkles: gold, lifted above the disk by the highs (less at the rim,
+  // with a slow bob, so they read as dust over the disk, not strands)
+  var lift = E.high * R * 0.30;
+  for (i = N_DISK; i < N; i++) {
+    rr = pRad[i] * breathe * R;
+    x = cx + Math.cos(pAng[i]) * rr;
+    y = cy + Math.sin(pAng[i]) * rr * SQUASH
+      - lift * (0.3 + pSeed[i]) * (1.1 - pRad[i] * 0.6)
+      + Math.sin(simT * 0.7 + pSeed[i] * 50) * R * 0.02 * E.high;
+    var tw = 0.25 + 0.75 * E.high * (0.5 + 0.5 * Math.sin(simT * 3 + pSeed[i] * 40));
+    ctx.fillStyle = 'rgba(' + GOLD_RGB + ',' + Math.max(0.05, tw).toFixed(2) + ')';
+    var s2 = pSize[i] * sizeMul;
+    ctx.fillRect(x - s2 / 2, y - s2 / 2, s2, s2);
+  }
+  // beat flash: core snaps white, then decays
+  if (flash > 0.02) {
+    ctx.fillStyle = 'rgba(255,255,255,' + (flash * 0.85).toFixed(2) + ')';
+    ctx.beginPath(); ctx.arc(cx, cy, R * (0.05 + 0.05 * flash), 0, 6.2832); ctx.fill();
+    ctx.fillStyle = 'rgba(' + CORE_RGB + ',' + (flash * 0.15).toFixed(2) + ')';
+    ctx.beginPath(); ctx.arc(cx, cy, R * 0.17 * (1 + 0.3 * flash), 0, 6.2832); ctx.fill();
+  }
+}
+
+var lastNow = null;
+function drawFrame(nowMs) {
+  var dt;
+  if (lastNow == null) { dt = 1 / 30; }
+  else { dt = Math.min(0.05, Math.max(0.001, (nowMs - lastNow) / 1000)); }
+  lastNow = nowMs;
+  var breathe = stepSim(dt);
+  drawGalaxy(breathe, true);
+}
+function loop(nowMs) {
+  drawFrame(nowMs);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+}
+
+// first frame: pre-roll the simulation so a developed galaxy with trails
+// is already there (deterministic demo drive, fixed steps)
+(function preroll() {
+  var b = 1;
+  drawGalaxy(1, false);
+  for (var s = 0; s < 150; s++) { b = stepSim(1 / 30); drawGalaxy(b, true); }
+  flash = 0; flare = 0; lastBeat = simT;   // settle: first presented frame is not mid-flash
+})();
+// start the continuous loop (guarded for the node-canvas QA renderer)
+(function kick() {
+  drawFrame(1000 / 30);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+})();
+
+// ---------- interaction ----------
+function begin() {
+  if (!started) {
+    started = true;
+    startAudio();
+    var el = document.getElementById('begin');
+    if (el && el.classList) el.classList.add('gone');
+  }
+}
+function toLocal(ev) {
+  var r = (canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 });
+  return [ev.clientX - r.left, ev.clientY - r.top];
+}
+window.addEventListener('pointerdown', function (ev) {
+  begin();
+  pointerDown = true;
+  var p = toLocal(ev); pointerX = lastPX = p[0]; pointerY = lastPY = p[1];
+  pointerVX = 0; pointerVY = 0;
+});
+window.addEventListener('pointermove', function (ev) {
+  if (!pointerDown) return;
+  var p = toLocal(ev);
+  pointerVX = (p[0] - lastPX) * 0.06; pointerVY = (p[1] - lastPY) * 0.06;
+  lastPX = pointerX = p[0]; lastPY = pointerY = p[1];
+});
+function endPointer() { pointerDown = false; pointerVX = 0; pointerVY = 0; }
+window.addEventListener('pointerup', endPointer);
+window.addEventListener('pointercancel', endPointer);
+window.addEventListener('resize', function () { drawFrame(performance.now ? performance.now() : 0); });
+if (window.visualViewport && window.visualViewport.addEventListener) {
+  window.visualViewport.addEventListener('resize', function () { drawFrame(performance.now ? performance.now() : 0); });
+}
+</script>
+</body>
+</html>
