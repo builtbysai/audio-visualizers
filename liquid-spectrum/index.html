@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Liquid Spectrum</title>
+<style>
+html,body { margin:0; padding:0; height:100%; overflow:hidden; background:#060608; touch-action:none; }
+#stage { position:fixed; inset:0; display:block; }
+.hint { position:fixed; left:0; right:0; bottom:max(12px, env(safe-area-inset-bottom)); text-align:center; color:rgba(244,241,232,0.45); font:12px/1.4 -apple-system,"Segoe UI",system-ui,sans-serif; letter-spacing:0.14em; pointer-events:none; user-select:none; }
+#begin { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; color:rgba(244,241,232,0.85); font:14px/1.4 -apple-system,"Segoe UI",system-ui,sans-serif; letter-spacing:0.22em; background:rgba(6,6,8,0.35); cursor:pointer; user-select:none; }
+#begin.gone { display:none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div class="hint">press to push the surface</div>
+<div id="begin">tap to begin</div>
+<script>
+'use strict';
+// Liquid Spectrum.
+// The frequency spectrum as a living liquid. 48 blobs across the
+// bottom of the frame; each blob's height is its frequency bin's
+// energy, run through a spring so the surface wobbles instead of
+// snapping. Blobs are filled circles that overlap into one churning
+// mass, joined by a surface polyline through their tops. Color runs
+// teal at rest to lime at full height; the tallest three blobs wear
+// white foam caps. Above, the black sky holds a faint mirrored
+// reflection of the surface, drawn at half resolution.
+// Audio is a generative funk groove at 100bpm (syncopated bass,
+// wah-filtered chords, tight hats), Web Audio only, lookahead
+// scheduler, AnalyserNode feeding the springs. Until audio starts,
+// a synthetic demo spectrum drives the same springs, so the piece
+// is alive silently and renders identically in headless QA.
+
+const canvas = document.getElementById('stage');
+function viewportWH(){
+  const vv = window.visualViewport;
+  if (vv && vv.width > 0 && vv.height > 0) return [vv.width, vv.height];
+  return [window.innerWidth, window.innerHeight];
+}
+const ctx = canvas.getContext('2d');
+
+const GROUND = '#060608';
+const N = 48;
+
+// ---------- color: teal #2ee6a8 -> lime #7dd956 by height ----------
+const TEAL = [46, 230, 168], LIME = [125, 217, 86];
+function mixColor(u) {
+  const r = Math.round(TEAL[0] + (LIME[0] - TEAL[0]) * u);
+  const g = Math.round(TEAL[1] + (LIME[1] - TEAL[1]) * u);
+  const b = Math.round(TEAL[2] + (LIME[2] - TEAL[2]) * u);
+  return 'rgb(' + r + ',' + g + ',' + b + ')';
+}
+
+// ---------- liquid state ----------
+const blobs = [];
+for (let i = 0; i < N; i++) blobs.push({ h: 0.08, v: 0, target: 0.08 });
+const K = 0.045, DAMP = 0.86;
+let dent = null;              // {index, depth} while pressing
+let simTime = 0;
+
+// synthetic demo spectrum: a few moving humps + shimmer, funk-ish pulse
+function demoTarget(i, t) {
+  const x = i / (N - 1);
+  let e = 0.16
+    + 0.34 * Math.exp(-Math.pow((x - (0.16 + 0.05 * Math.sin(t * 0.7))) * 4.2, 2))
+    + 0.28 * Math.exp(-Math.pow((x - (0.48 + 0.06 * Math.sin(t * 0.5 + 2))) * 5.0, 2))
+    + 0.22 * Math.exp(-Math.pow((x - (0.78 + 0.04 * Math.sin(t * 0.9 + 4))) * 5.4, 2))
+    + 0.07 * Math.sin(t * 2.3 + i * 0.6)
+    + 0.05 * Math.sin(t * 5.1 + i * 1.7);
+  const beat = Math.pow(Math.max(0, Math.sin(t * Math.PI * (100 / 60))), 6); // 100bpm pulse
+  e += beat * 0.10 * (1 - x * 0.6);
+  return Math.max(0.02, Math.min(1, e));
+}
+
+let freqData = null;          // Uint8Array from the analyser, when audio runs
+function stepSprings(dt) {
+  simTime += dt;
+  for (let i = 0; i < N; i++) {
+    const b = blobs[i];
+    if (freqData) {
+      // map 48 log-spaced bins out of the analyser's fft bins
+      const lo = 2, hi = freqData.length * 0.72;
+      const f = lo * Math.pow(hi / lo, i / (N - 1));
+      const idx = Math.min(freqData.length - 1, Math.floor(f));
+      b.target = 0.04 + Math.pow(freqData[idx] / 255, 1.25) * 0.96;
+    } else {
+      b.target = demoTarget(i, simTime);
+    }
+    if (dent) {
+      const d = Math.abs(i - dent.index);
+      if (d < 6) b.target = Math.min(b.target, Math.max(0.02, 0.30 - dent.depth * (1 - d / 6)));
+    }
+    b.v += (b.target - b.h) * K;
+    b.v *= DAMP;
+    b.h += b.v;
+    if (b.h < 0.015) { b.h = 0.015; b.v = 0; }
+    if (b.h > 1.08) { b.h = 1.08; b.v *= 0.5; }
+  }
+}
+// pre-roll so the first painted frame already shows a developed surface
+for (let s = 0; s < 150; s++) stepSprings(1 / 60);
+
+// ---------- drawing ----------
+function drawSurface(w, h, alpha, ghost) {
+  const baseY = h * 0.94;
+  const maxH = h * 0.55;
+  const bw = w / N;
+  const raw = blobs.map(b => b.h);
+  const passes = w < 700 ? 2 : 1;                    // narrower field, smoother read
+  let sm = raw.slice();
+  for (let s = 0; s < passes; s++) {
+    const prev = sm.slice();
+    for (let i = 0; i < N; i++) {
+      const hm = prev[Math.max(0, i - 1)], hp = prev[Math.min(N - 1, i + 1)];
+      sm[i] = (hm + 2 * prev[i] + hp) / 4;
+    }
+  }
+  const tops = [];
+  for (let i = 0; i < N; i++) {
+    const x = (i + 0.5) * bw;
+    const y = baseY - sm[i] * maxH;
+    tops.push([x, y, blobs[i].h]);
+  }
+  ctx.globalAlpha = alpha;
+  // liquid body: fill under the surface polyline. The ghost only
+  // fills a shallow band under its surface, so the reflection
+  // floats in the sky instead of mirroring the whole depth.
+  const depth = ghost ? h * 0.07 : (h + 2 - 0);
+  ctx.beginPath();
+  ctx.moveTo(0, ghost ? tops[0][1] + depth : h + 2);
+  if (!ghost) ctx.lineTo(tops[0][0] - bw, tops[0][1]);
+  for (let i = 0; i < N; i++) {
+    const [x, y] = tops[i];
+    if (i === 0) ctx.lineTo(x, y);
+    else {
+      const [px, py] = tops[i - 1];
+      const mx = (px + x) / 2, my = (py + y) / 2;
+      ctx.quadraticCurveTo(px, py, mx, my);
+      if (i === N - 1) ctx.lineTo(x, y);
+    }
+  }
+  if (ghost) {
+    for (let i = N - 1; i >= 0; i--) ctx.lineTo(tops[i][0], tops[i][1] + depth);
+  } else {
+    ctx.lineTo(w + bw, tops[N - 1][1]);
+    ctx.lineTo(w, h + 2);
+  }
+  ctx.closePath();
+  if (ghost) {
+    ctx.fillStyle = mixColor(0.45);
+  } else {
+    const grad = ctx.createLinearGradient(0, baseY - maxH, 0, baseY);
+    grad.addColorStop(0, mixColor(0.85));
+    grad.addColorStop(1, mixColor(0.10));
+    ctx.fillStyle = grad;
+  }
+  ctx.fill();
+  // blobs: circles along each column, overlap makes them merge
+  const stepI = ghost ? 2 : 1;          // ghost draws at half resolution
+  for (let i = 0; i < N; i += stepI) {
+    const [x, y, hh] = tops[i];
+    const r = bw * (0.62 + hh * 0.30);
+    ctx.fillStyle = mixColor(Math.min(1, hh));
+    ctx.beginPath();
+    ctx.arc(x, y + r * 0.35, r, 0, Math.PI * 2);
+    ctx.fill();
+    if (!ghost) {
+      ctx.fillStyle = mixColor(Math.min(1, hh * 0.45));
+      ctx.beginPath();
+      ctx.arc(x, (y + baseY) / 2, r * 0.9, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  // surface line, smoothed through midpoints
+  ctx.strokeStyle = mixColor(0.95);
+  ctx.lineWidth = Math.max(1, h * 0.0035);
+  ctx.beginPath();
+  ctx.moveTo(tops[0][0] - bw, tops[0][1]);
+  for (let i = 0; i < N; i++) {
+    const [x, y] = tops[i];
+    if (i === 0) ctx.lineTo(x, y);
+    else {
+      const [px, py] = tops[i - 1];
+      ctx.quadraticCurveTo(px, py, (px + x) / 2, (py + y) / 2);
+      if (i === N - 1) ctx.lineTo(x, y);
+    }
+  }
+  ctx.stroke();
+  // foam caps on the tallest three
+  const order = ghost ? [] : tops.map((t, i) => i).sort((a, b) => tops[b][2] - tops[a][2]).slice(0, 3);
+  ctx.fillStyle = '#f4f1e8';
+  for (const i of order) {
+    const [x, y, hh] = tops[i];
+    if (hh < 0.30) continue;
+    const r = bw * (0.30 + hh * 0.16);
+    ctx.beginPath();
+    ctx.arc(x, y - r * 0.15, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(x - r * 0.8, y + r * 0.25, r * 0.55, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(x + r * 0.8, y + r * 0.25, r * 0.55, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawFrame(nowMs) {
+  const [w, h] = viewportWH();
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+
+  // advance springs a fixed step per frame (demo or audio)
+  if (freqData && analyser) analyser.getByteFrequencyData(freqData);
+  stepSprings(1 / 60);
+
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, w, h);
+
+  // reflection: the liquid mirrored into the sky above, 20% alpha,
+  // drawn at half resolution (every other blob, no foam)
+  const axisY = h * 0.40;
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, 0, w, axisY + h * 0.02);
+  ctx.clip();
+  ctx.translate(0, 2 * axisY);
+  ctx.scale(1, -1);
+  drawSurface(w, h, 0.20, true);
+  ctx.restore();
+
+  // the liquid itself
+  drawSurface(w, h, 1, false);
+  return {};
+}
+
+let rafLast = 0;
+function loop(nowMs) {
+  drawFrame(nowMs);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+}
+drawFrame(0);
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+
+// ---------- interaction: press dents the surface ----------
+function pointerToDent(ev) {
+  const [w, h] = viewportWH();
+  const r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+  const x = ev.clientX - r.left, y = ev.clientY - r.top;
+  const idx = Math.max(0, Math.min(N - 1, Math.floor((x / w) * N)));
+  const depth = Math.max(0.1, Math.min(1, (y - h * 0.39) / (h * 0.55)));
+  return { index: idx, depth: depth };
+}
+canvas.addEventListener('pointerdown', ev => { dent = pointerToDent(ev); });
+canvas.addEventListener('pointermove', ev => { if (dent) dent = pointerToDent(ev); });
+function endDent() {
+  if (!dent) return;
+  // slosh back: give the dented region an upward kick
+  for (let i = 0; i < N; i++) {
+    const d = Math.abs(i - dent.index);
+    if (d < 6) blobs[i].v += 0.05 * (1 - d / 6);
+  }
+  dent = null;
+}
+canvas.addEventListener('pointerup', endDent);
+canvas.addEventListener('pointercancel', endDent);
+window.addEventListener('resize', () => drawFrame(performance.now()));
+if (window.visualViewport) window.visualViewport.addEventListener('resize', () => drawFrame(performance.now()));
+
+// ---------- audio: generative funk, 100bpm, lookahead scheduler ----------
+let actx = null, analyser = null, master = null;
+let schedTimer = null, nextNoteTime = 0, step16 = 0;
+const BPM = 100, SPB = 60 / BPM, STEP = SPB / 4;   // 16th notes
+
+// chord loop: Fm9 - Abmaj7 - Ebmaj9 - Dbmaj7-ish roots (Hz)
+const ROOTS = [43.65, 51.91, 38.89, 34.65];         // F1, Ab1, Eb1, Db1 (x2 for groove weight use *2)
+const BASSLINE = [ // per bar: [step, semitone offset from root*2, len steps]
+  [0, 0, 2], [3, 0, 1], [6, 7, 1], [8, 0, 2], [11, 12, 1], [14, 10, 1]
+];
+const CHORD_TONES = [0, 3, 7, 14];                  // root, b3, 5, 9 in semitones
+
+function midiHz(root, semi) { return root * Math.pow(2, semi / 12); }
+
+function playBass(freq, t, dur) {
+  const o = actx.createOscillator(), g = actx.createGain(), f = actx.createBiquadFilter();
+  o.type = 'square';
+  o.frequency.value = freq;
+  f.type = 'lowpass'; f.frequency.setValueAtTime(freq * 6, t);
+  f.frequency.exponentialRampToValueAtTime(freq * 1.6, t + dur);
+  f.Q.value = 6;
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.50, t + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  o.connect(f); f.connect(g); g.connect(master);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+let wahPhase = 0;
+function playChord(rootFreq, t, dur) {
+  const f = actx.createBiquadFilter(), g = actx.createGain();
+  f.type = 'bandpass'; f.Q.value = 2.2;
+  wahPhase += 1;
+  const sweep = 500 + 900 * (0.5 + 0.5 * Math.sin(wahPhase * 1.7));
+  f.frequency.setValueAtTime(sweep * 0.6, t);
+  f.frequency.exponentialRampToValueAtTime(sweep, t + dur * 0.7);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.16, t + 0.03);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  f.connect(g); g.connect(master);
+  CHORD_TONES.forEach(semi => {
+    const o = actx.createOscillator();
+    o.type = 'sawtooth';
+    o.frequency.value = midiHz(rootFreq * 4, semi);
+    o.connect(f);
+    o.start(t); o.stop(t + dur + 0.05);
+  });
+}
+let noiseBuf = null;
+function playHat(t, open) {
+  if (!noiseBuf) {
+    noiseBuf = actx.createBuffer(1, actx.sampleRate * 0.5, actx.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  }
+  const src = actx.createBufferSource(); src.buffer = noiseBuf;
+  const f = actx.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = 7500;
+  const g = actx.createGain();
+  const dur = open ? 0.22 : 0.045;
+  g.gain.setValueAtTime(open ? 0.20 : 0.26, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  src.connect(f); f.connect(g); g.connect(master);
+  src.start(t); src.stop(t + dur + 0.02);
+}
+function playKick(t) {
+  const o = actx.createOscillator(), g = actx.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(150, t);
+  o.frequency.exponentialRampToValueAtTime(42, t + 0.11);
+  g.gain.setValueAtTime(0.85, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.24);
+  o.connect(g); g.connect(master);
+  o.start(t); o.stop(t + 0.3);
+}
+function splash() {
+  for (let i = 0; i < N; i++) blobs[i].v += 0.055 + 0.03 * Math.sin(i * 0.7);
+}
+function scheduleStep(step, t) {
+  const bar = Math.floor(step / 16) % 4;
+  const s16 = step % 16;
+  const root = ROOTS[bar] * 2;
+  if (s16 === 0) splash();
+  if (s16 === 0 || s16 === 7 || s16 === 10) playKick(t);
+  for (const [bs, semi, len] of BASSLINE) {
+    if (bs === s16) playBass(midiHz(root, semi), t, len * STEP * 0.95);
+  }
+  if (s16 === 4 || s16 === 12) playChord(root, t, SPB * 0.9);
+  if (s16 % 2 === 0) playHat(t, false);
+  if (s16 === 14) playHat(t, true);
+}
+function scheduler() {
+  if (!actx) return;
+  while (nextNoteTime < actx.currentTime + 0.12) {
+    scheduleStep(step16, nextNoteTime);
+    nextNoteTime += STEP;
+    step16++;
+  }
+}
+function startAudio() {
+  if (actx) { if (actx.resume) actx.resume(); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return;                       // silent demo mode continues
+  actx = new AC();
+  master = actx.createGain();
+  master.gain.value = 0.8;
+  analyser = actx.createAnalyser();
+  analyser.fftSize = 2048;
+  analyser.smoothingTimeConstant = 0.55;
+  master.connect(analyser);
+  analyser.connect(actx.destination);
+  freqData = new Uint8Array(analyser.frequencyBinCount);
+  nextNoteTime = actx.currentTime + 0.06;
+  step16 = 0;
+  schedTimer = setInterval(scheduler, 25);
+}
+
+const beginEl = document.getElementById('begin');
+function begin() {
+  startAudio();
+  if (beginEl) beginEl.className = 'gone';
+}
+if (beginEl) beginEl.addEventListener('pointerdown', begin);
+canvas.addEventListener('pointerdown', () => { if (!actx) begin(); }, { once: true });
+</script>
+</body>
+</html>
