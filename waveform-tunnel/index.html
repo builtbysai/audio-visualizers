@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Waveform Tunnel</title>
+<style>
+html,body { margin:0; padding:0; height:100%; overflow:hidden; background:#040406; touch-action:none; }
+#stage { position:fixed; inset:0; display:block; }
+.hint { position:fixed; left:0; right:0; bottom:max(12px, env(safe-area-inset-bottom)); text-align:center; color:rgba(200,190,255,0.45); font:12px/1.4 -apple-system,"Segoe UI",system-ui,sans-serif; letter-spacing:0.14em; pointer-events:none; user-select:none; }
+#overlay { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; color:rgba(230,225,255,0.85); font:14px/1.4 -apple-system,"Segoe UI",system-ui,sans-serif; letter-spacing:0.2em; background:rgba(4,4,6,0.35); cursor:pointer; user-select:none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div class="hint">drag to steer</div>
+<div id="overlay">tap to begin</div>
+<script>
+'use strict';
+// Waveform Tunnel.
+// First-person flight through an endless tunnel whose walls are the
+// live waveform. ~24 rings recede from the camera; each ring's radius
+// is modulated by the time-domain data at its depth, so the tunnel
+// breathes and flexes with the sound. Ring color runs from violet
+// near the camera to deep purple far away; strong peaks flash hot
+// pink. Steering: drag moves the vanishing point and banks the
+// tunnel; on release it eases back to center.
+// Audio: a generative ambient drone (detuned saws through a lowpass
+// whose cutoff follows a 32s LFO, plus sparse plucks), Web Audio
+// only. An AnalyserNode feeds the visuals. Until audio starts (and
+// whenever AudioContext is unavailable, e.g. headless QA), a
+// synthetic demo waveform drives the same drawing path.
+
+const canvas = document.getElementById('stage');
+function viewportWH(){
+  const vv = window.visualViewport;
+  if (vv && vv.width > 0 && vv.height > 0) return [vv.width, vv.height];
+  return [window.innerWidth, window.innerHeight];
+}
+const ctx = canvas.getContext('2d');
+
+const GROUND = '#040406';
+const RING_NEAR = [138, 99, 255];    // #8a63ff
+const RING_FAR = [42, 26, 94];      // #2a1a5e
+const PEAK = [255, 77, 126];        // #ff4d7e
+const RINGS = 24;
+const PTS = 64;                     // waveform samples around each ring
+
+// ---------------------------------------------------------------- audio
+let audioCtx = null, analyser = null, timeData = null;
+let audioStarted = false;
+
+function startAudio() {
+  if (audioStarted) return;
+  audioStarted = true;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    audioCtx = new AC();
+
+    const master = audioCtx.createGain();
+    master.gain.value = 0.5;
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.82;
+    timeData = new Uint8Array(analyser.fftSize);
+    master.connect(analyser);
+    analyser.connect(audioCtx.destination);
+
+    // drone: two detuned saws + sub sine through one swept lowpass
+    const droneGain = audioCtx.createGain();
+    droneGain.gain.value = 0.16;
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 420;
+    filter.Q.value = 6;
+    filter.connect(droneGain);
+    droneGain.connect(master);
+
+    const mkOsc = (type, freq, detune) => {
+      const o = audioCtx.createOscillator();
+      o.type = type; o.frequency.value = freq; o.detune.value = detune;
+      o.connect(filter); o.start();
+      return o;
+    };
+    mkOsc('sawtooth', 55, 0);
+    mkOsc('sawtooth', 55, 9);
+    mkOsc('sawtooth', 110.3, -6);
+    const sub = audioCtx.createOscillator();
+    sub.type = 'sine'; sub.frequency.value = 27.5;
+    const subGain = audioCtx.createGain(); subGain.gain.value = 0.5;
+    sub.connect(subGain); subGain.connect(droneGain); sub.start();
+
+    // 32s LFO on the cutoff, plus a slow chord drift every 16s
+    const lfo = audioCtx.createOscillator();
+    lfo.type = 'sine'; lfo.frequency.value = 1 / 32;
+    const lfoGain = audioCtx.createGain(); lfoGain.gain.value = 260;
+    lfo.connect(lfoGain); lfoGain.connect(filter.frequency); lfo.start();
+    const roots = [55, 49, 65.41, 43.65];
+    let ri = 0;
+    setInterval(() => {
+      if (!audioCtx) return;
+      ri = (ri + 1) % roots.length;
+      // slow chord drift: retune the sub root every 16s
+      sub.frequency.setTargetAtTime(roots[ri] / 2, audioCtx.currentTime, 2.5);
+    }, 16000);
+
+    // sparse plucks: short triangle notes from a minor scale, random gaps
+    const scale = [220, 261.63, 329.63, 392, 523.25, 659.25];
+    const pluck = () => {
+      if (!audioCtx) return;
+      const t = audioCtx.currentTime;
+      const o = audioCtx.createOscillator();
+      o.type = 'triangle';
+      o.frequency.value = scale[(Math.random() * scale.length) | 0] * (Math.random() < 0.3 ? 2 : 1);
+      const g = audioCtx.createGain();
+      g.gain.setValueAtTime(0, t);
+      g.gain.linearRampToValueAtTime(0.11, t + 0.012);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 1.6);
+      o.connect(g); g.connect(master);
+      o.start(t); o.stop(t + 1.7);
+      setTimeout(pluck, 1400 + Math.random() * 4200);
+    };
+    setTimeout(pluck, 900);
+  } catch (e) {
+    audioCtx = null; analyser = null;
+  }
+}
+
+// ------------------------------------------------------- waveform source
+// Returns an array of PTS values in -1..1 for a given depth, either
+// from the analyser (live) or from the synthetic demo signal.
+const waveBuf = new Float32Array(PTS);
+function demoWave(depth, t) {
+  for (let i = 0; i < PTS; i++) {
+    const a = (i / PTS) * Math.PI * 2;
+    waveBuf[i] =
+      0.44 * Math.sin(a * 3 + t * 1.7 + depth * 2.6) +
+      0.26 * Math.sin(a * 5 - t * 2.3 + depth * 4.2) +
+      0.13 * Math.sin(a * 8 + t * 0.9 - depth * 6.0);
+  }
+  return waveBuf;
+}
+function liveWave(depth) {
+  analyser.getByteTimeDomainData(timeData);
+  const N = timeData.length;
+  const base = Math.floor(depth * (N - PTS * 4));
+  for (let i = 0; i < PTS; i++) {
+    waveBuf[i] = (timeData[(base + i * 4) % N] - 128) / 128;
+  }
+  return waveBuf;
+}
+function energy() {
+  if (analyser && timeData) {
+    analyser.getByteTimeDomainData(timeData);
+    let s = 0;
+    for (let i = 0; i < timeData.length; i += 8) {
+      const v = (timeData[i] - 128) / 128;
+      s += v * v;
+    }
+    return Math.sqrt(s / (timeData.length / 8));
+  }
+  return -1; // demo mode
+}
+
+// ---------------------------------------------------------------- tunnel
+const rings = [];
+for (let i = 0; i < RINGS; i++) rings.push({ depth: i / RINGS });
+
+let steer = { x: 0, y: 0 };        // current vanishing-point offset (-1..1)
+let steerDrag = null;               // target while dragging
+let steerEase = { x: 0, y: 0 };     // decaying offset after release
+let dragging = false;
+let dragStart = null;
+
+function mixc(a, b, f) {
+  return 'rgb(' + Math.round(a[0] + (b[0] - a[0]) * f) + ',' +
+                  Math.round(a[1] + (b[1] - a[1]) * f) + ',' +
+                  Math.round(a[2] + (b[2] - a[2]) * f) + ')';
+}
+
+let lastNow = null;
+function drawFrame(nowMs) {
+  const [w, h] = viewportWH();
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, w, h);
+
+  const t = nowMs / 1000;
+  let dt = 0;
+  if (lastNow != null) dt = Math.min(0.05, (nowMs - lastNow) / 1000);
+  lastNow = nowMs;
+
+  // forward speed scales with overall energy (demo: slow pulse)
+  const en = energy();
+  const speed = en >= 0
+    ? 0.045 + Math.min(0.16, en * 0.55)
+    : 0.07 + 0.03 * (0.5 + 0.5 * Math.sin(t * 0.45));
+  for (const r of rings) {
+    r.depth -= speed * dt;
+    if (r.depth < 0) r.depth += 1;
+  }
+
+  // steering: drag target wins; otherwise ease back to center
+  if (steerDrag) { steer.x = steerDrag.x; steer.y = steerDrag.y; }
+  else {
+    steerEase.x *= 0.965; steerEase.y *= 0.965;
+    steer.x = steerEase.x; steer.y = steerEase.y;
+  }
+  const bank = steer.x * 0.35;
+  const cx = w / 2 + steer.x * w * 0.26;
+  const cy = h / 2 + steer.y * h * 0.26;
+  const maxR = Math.hypot(w, h) * 0.62;
+
+  const live = !!(analyser && timeData);
+  const sorted = rings.slice().sort((a, b) => a.depth - b.depth); // far first
+  for (const ring of sorted) {
+    const d = ring.depth;                       // 0 far, 1 near
+    const persp = Math.pow(1 - d, 2.1);         // grows fast near camera
+    const baseR = 6 + persp * maxR;
+    const wave = live ? liveWave(d) : demoWave(d, t);
+    const depthFactor = 0.34;
+    ctx.beginPath();
+    for (let i = 0; i <= PTS; i++) {
+      const k = i % PTS;
+      const a = (k / PTS) * Math.PI * 2 + bank;
+      const r = baseR * (1 + wave[k] * depthFactor);
+      const x = cx + Math.cos(a) * r;
+      const y = cy + Math.sin(a) * r * 0.86;     // squash for perspective
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    // peaks flash pink: blend color by this ring's strongest sample
+    let peak = 0;
+    for (let i = 0; i < PTS; i++) peak = Math.max(peak, Math.abs(wave[i]));
+    const base = [
+      RING_FAR[0] + (RING_NEAR[0] - RING_FAR[0]) * (1 - d),
+      RING_FAR[1] + (RING_NEAR[1] - RING_FAR[1]) * (1 - d),
+      RING_FAR[2] + (RING_NEAR[2] - RING_FAR[2]) * (1 - d)
+    ];
+    const pinkF = Math.min(1, Math.max(0, (peak - 0.68) / 0.3)) * 0.9;
+    ctx.strokeStyle = mixc(base, PEAK, pinkF);
+    ctx.globalAlpha = 0.25 + 0.75 * (1 - d);
+    ctx.lineWidth = Math.max(0.7, (1 - d) * 3.2);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+  }
+  return {};
+}
+
+function loop(nowMs) {
+  drawFrame(nowMs);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+}
+drawFrame(5200);
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+
+// ---------------------------------------------------------------- input
+const overlay = document.getElementById('overlay');
+function begin() {
+  startAudio();
+  if (overlay) overlay.style.display = 'none';
+  if (audioCtx && audioCtx.resume) audioCtx.resume();
+}
+if (overlay) overlay.addEventListener('pointerdown', begin);
+canvas.addEventListener('pointerdown', ev => {
+  begin();
+  dragging = true;
+  dragStart = { x: ev.clientX, y: ev.clientY };
+});
+canvas.addEventListener('pointermove', ev => {
+  if (!dragging || !dragStart) return;
+  const [w, h] = viewportWH();
+  steerDrag = {
+    x: Math.max(-1, Math.min(1, (ev.clientX - dragStart.x) / (w * 0.4))),
+    y: Math.max(-1, Math.min(1, (ev.clientY - dragStart.y) / (h * 0.4)))
+  };
+});
+function endDrag() {
+  if (!dragging) return;
+  dragging = false;
+  steerEase = { x: steer.x, y: steer.y };
+  steerDrag = null;
+  dragStart = null;
+}
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
+window.addEventListener('resize', () => drawFrame(performance.now()));
+if (window.visualViewport) window.visualViewport.addEventListener('resize', () => drawFrame(performance.now()));
+</script>
+</body>
+</html>
