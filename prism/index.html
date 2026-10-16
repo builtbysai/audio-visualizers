@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>prism</title>
+<style>
+html,body { margin:0; padding:0; height:100%; overflow:hidden; background:#07070a; touch-action:none; }
+#stage { position:fixed; inset:0; display:block; }
+.hint { position:fixed; left:0; right:0; bottom:max(12px, env(safe-area-inset-bottom)); text-align:center; color:rgba(55,230,255,0.45); font:12px/1.4 -apple-system,"Segoe UI",system-ui,sans-serif; letter-spacing:0.14em; pointer-events:none; user-select:none; }
+#begin { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:rgba(7,7,10,0.55); color:rgba(255,255,255,0.85); font:13px/1.4 -apple-system,"Segoe UI",system-ui,sans-serif; letter-spacing:0.22em; cursor:pointer; user-select:none; z-index:2; }
+#begin.gone { display:none; }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<div id="begin">tap to begin</div>
+<div class="hint">drag to spin</div>
+<script>
+'use strict';
+// prism: a wireframe icosahedron tumbling in the dark, its vertices
+// pushed outward by the spectrum of a generative idm loop. a dim
+// ghost of the same shape trails a second and a half behind at 60%
+// scale. canvas 2d pseudo-3d, manual projection, no libraries.
+// audio is web audio only, started on the first tap; until then the
+// shape dances to a synthetic demo spectrum so the frame is always
+// alive. drag spins it with inertia.
+
+function mulberry32(a){return function(){a|=0;a=(a+0x6D2B79F5)|0;var t=Math.imul(a^(a>>>15),1|a);t=(t+Math.imul(t^(t>>>7),61|t))^t;return((t^(t>>>14))>>>0)/4294967296}}
+
+var qs = new URLSearchParams(location.search);
+var seed = parseInt(qs.get('seed') || '7', 10) || 7;
+var rng = mulberry32(seed * 7919 + 13);
+
+var canvas = document.getElementById('stage');
+function viewportWH(){
+  var vv = window.visualViewport;
+  if (vv && vv.width > 0 && vv.height > 0) return [vv.width, vv.height];
+  return [window.innerWidth, window.innerHeight];
+}
+var ctx = canvas.getContext('2d');
+
+var GROUND = '#07070a';
+var MAGENTA = '#ff2e88';
+var CYAN = '#37e6ff';
+var SLATE = '#2a3440';
+
+// ---------- geometry: icosahedron, faces subdivided once ----------
+// 12 corners + 30 edge midpoints = 42 vertices, so the spectrum has
+// plenty of points to push on while the silhouette stays the classic
+// 12-vertex read. all arrays are built once, fixed size.
+var PHI = (1 + Math.sqrt(5)) / 2;
+var raw = [
+  [-1, PHI, 0], [1, PHI, 0], [-1, -PHI, 0], [1, -PHI, 0],
+  [0, -1, PHI], [0, 1, PHI], [0, -1, -PHI], [0, 1, -PHI],
+  [PHI, 0, -1], [PHI, 0, 1], [-PHI, 0, -1], [-PHI, 0, 1]
+];
+var NV = 42;
+var verts = new Float32Array(NV * 3);       // unit-sphere positions (= normals)
+function setVert(i, x, y, z) {
+  var l = Math.sqrt(x * x + y * y + z * z);
+  verts[i * 3] = x / l; verts[i * 3 + 1] = y / l; verts[i * 3 + 2] = z / l;
+}
+for (var ci = 0; ci < 12; ci++) setVert(ci, raw[ci][0], raw[ci][1], raw[ci][2]);
+
+// corner edges: pairs at the minimum corner distance
+var cornerEdges = [];
+var edgeIndex = {};                          // "a_b" -> midpoint vertex index
+for (var a = 0; a < 12; a++) for (var b = a + 1; b < 12; b++) {
+  var dx = raw[a][0] - raw[b][0], dy = raw[a][1] - raw[b][1], dz = raw[a][2] - raw[b][2];
+  if (Math.sqrt(dx * dx + dy * dy + dz * dz) < 2.01) cornerEdges.push([a, b]);
+}
+cornerEdges.forEach(function(e, k) {
+  var mid = 12 + k;
+  edgeIndex[e[0] + '_' + e[1]] = mid;
+  setVert(mid,
+    verts[e[0] * 3] + verts[e[1] * 3],
+    verts[e[0] * 3 + 1] + verts[e[1] * 3 + 1],
+    verts[e[0] * 3 + 2] + verts[e[1] * 3 + 2]);
+});
+function midOf(a, b) { return edgeIndex[Math.min(a, b) + '_' + Math.max(a, b)]; }
+
+// corner faces: triples of mutually adjacent corners
+function adjacent(a, b) { return edgeIndex[a + '_' + b] !== undefined || edgeIndex[b + '_' + a] !== undefined; }
+var faces = [];
+for (var f1 = 0; f1 < 12; f1++) for (var f2 = f1 + 1; f2 < 12; f2++) for (var f3 = f2 + 1; f3 < 12; f3++) {
+  if (adjacent(f1, f2) && adjacent(f2, f3) && adjacent(f1, f3)) faces.push([f1, f2, f3]);
+}
+
+// wireframe edge list after one subdivision: corner-midpoint halves
+// (60) plus the inner midpoint triangles (3 per face, 60) = 120.
+var edgeSet = {};
+var edges = [];
+function addEdge(u, v) {
+  var key = Math.min(u, v) + '_' + Math.max(u, v);
+  if (edgeSet[key]) return;
+  edgeSet[key] = 1;
+  edges.push([u, v]);
+}
+cornerEdges.forEach(function(e) {
+  var m = midOf(e[0], e[1]);
+  addEdge(e[0], m); addEdge(m, e[1]);
+});
+faces.forEach(function(f) {
+  var m1 = midOf(f[0], f[1]), m2 = midOf(f[1], f[2]), m3 = midOf(f[2], f[0]);
+  addEdge(m1, m2); addEdge(m2, m3); addEdge(m3, m1);
+});
+var NE = edges.length;
+
+// each vertex listens to one spectrum slot, assigned in a seeded
+// shuffle so neighbouring spikes do not all read the same band
+var vBin = new Int16Array(NV);
+(function() {
+  var slots = [];
+  for (var i = 0; i < NV; i++) slots.push(Math.round((i / (NV - 1)) * 127));
+  for (var i = NV - 1; i > 0; i--) {
+    var j = (rng() * (i + 1)) | 0;
+    var tmp = slots[i]; slots[i] = slots[j]; slots[j] = tmp;
+  }
+  for (var k = 0; k < NV; k++) vBin[k] = slots[k];
+})();
+
+// ---------- state ----------
+var MAXD = 0.38;
+var disp = new Float32Array(NV);             // smoothed displacement per vertex
+var proj = new Float32Array(NV * 3);         // projected x, y, depth scale
+var spec = new Float32Array(128);            // 0..1 spectrum the shape reads
+var rotX = 0.6, rotY = -0.4;
+var velX = 0, velY = 0;                      // drag momentum
+var pulse = 0;                               // beat scale pulse, smoothed
+var dragging = false;
+var lastPX = 0, lastPY = 0;
+
+// ghost: ring buffer of the last 90 frames (~1.5s at 60fps); the ghost
+// is the oldest snapshot, redrawn at 60% scale in slate.
+var GHOST_N = 90;
+var ghostRing = [];
+for (var g = 0; g < GHOST_N; g++) ghostRing.push({ x: 0, y: 0, p: 0, d: new Float32Array(NV) });
+var ghostHead = 0, ghostCount = 0;
+
+// ---------- synthetic demo spectrum (until audio starts) ----------
+function demoSpec(t) {
+  var beat = (t * 132 / 60) % 1;
+  var kick = Math.exp(-beat * 5.5);
+  var bar = Math.floor(t * 132 / 60 / 4);
+  for (var i = 0; i < 128; i++) {
+    var f = i / 127;
+    var v = 0.10 + 0.08 * Math.sin(t * 0.6 + i * 0.33) * Math.sin(t * 0.23 + i * 0.11);
+    v += kick * Math.exp(-f * 9) * 0.95;                                   // sub + kick weight
+    v += Math.max(0, Math.sin(t * 1.7 + i * 0.9 + Math.sin(bar * 3.7 + i) * 1.5)) * 0.30 * Math.exp(-Math.abs(f - 0.45) * 4);
+    v += Math.max(0, Math.sin(t * 2.9 - i * 1.7)) * 0.16 * f;             // hat shimmer up top
+    spec[i] = v < 0 ? 0 : (v > 1 ? 1 : v);
+  }
+}
+
+// ---------- audio: generative idm, web audio only ----------
+var AC = (typeof AudioContext !== 'undefined') ? AudioContext
+       : (typeof webkitAudioContext !== 'undefined' ? webkitAudioContext : null);
+var audio = null;                            // {ctx, analyser, freqData, ...}
+var freqData = null;
+
+function startAudio() {
+  if (audio || !AC) return;
+  try {
+    var ac = new AC();
+    var master = ac.createGain(); master.gain.value = 0.8;
+    var analyser = ac.createAnalyser();
+    analyser.fftSize = 2048;
+    analyser.smoothingTimeConstant = 0.55;
+    var comp = ac.createDynamicsCompressor();
+    master.connect(comp); comp.connect(analyser); analyser.connect(ac.destination);
+    freqData = new Uint8Array(analyser.frequencyBinCount);
+
+    // shared noise buffer for hats and snare
+    var noiseBuf = ac.createBuffer(1, ac.sampleRate * 0.5, ac.sampleRate);
+    var nd = noiseBuf.getChannelData(0);
+    for (var i = 0; i < nd.length; i++) nd[i] = Math.random() * 2 - 1;
+
+    var A = {
+      ctx: ac, master: master, analyser: analyser, noiseBuf: noiseBuf,
+      step: 0, nextTime: ac.currentTime + 0.06, timer: null,
+      root: 55,                                // A1 sub root
+      melody: []
+    };
+    var scaleDeg = [0, 3, 5, 7, 10, 12, 15, 12];
+    var mr = mulberry32(seed * 31 + 5);
+    for (var m = 0; m < 64; m++) A.melody.push(scaleDeg[(mr() * scaleDeg.length) | 0]);
+
+    function env(g, t, peak, dec) {
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(peak, t + 0.004);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dec);
+    }
+    function kick(t) {
+      var o = ac.createOscillator(), g = ac.createGain();
+      o.frequency.setValueAtTime(150, t);
+      o.frequency.exponentialRampToValueAtTime(44, t + 0.11);
+      env(g, t, 0.9, 0.24);
+      o.connect(g); g.connect(A.master);
+      o.start(t); o.stop(t + 0.3);
+    }
+    function sub(t, freq, dec) {
+      var o = ac.createOscillator(), g = ac.createGain();
+      o.type = 'sine'; o.frequency.value = freq;
+      env(g, t, 0.5, dec);
+      o.connect(g); g.connect(A.master);
+      o.start(t); o.stop(t + dec + 0.05);
+    }
+    function hat(t, open) {
+      var src = ac.createBufferSource(); src.buffer = A.noiseBuf;
+      var f = ac.createBiquadFilter(); f.type = 'highpass'; f.frequency.value = 7500;
+      var g = ac.createGain();
+      env(g, t, open ? 0.16 : 0.11, open ? 0.18 : 0.05);
+      src.connect(f); f.connect(g); g.connect(A.master);
+      src.start(t); src.stop(t + 0.25);
+    }
+    function snare(t) {
+      var src = ac.createBufferSource(); src.buffer = A.noiseBuf;
+      var f = ac.createBiquadFilter(); f.type = 'bandpass'; f.frequency.value = 1900; f.Q.value = 0.8;
+      var g = ac.createGain();
+      env(g, t, 0.32, 0.13);
+      src.connect(f); f.connect(g); g.connect(A.master);
+      src.start(t); src.stop(t + 0.2);
+    }
+    function pluck(t, deg) {
+      var freq = 220 * Math.pow(2, deg / 12);
+      var car = ac.createOscillator(), mod = ac.createOscillator();
+      var mg = ac.createGain(), g = ac.createGain();
+      mod.frequency.value = freq * 2.01;
+      mg.gain.setValueAtTime(freq * 2.4, t);
+      mg.gain.exponentialRampToValueAtTime(freq * 0.2, t + 0.22);
+      car.frequency.value = freq;
+      env(g, t, 0.20, 0.30);
+      mod.connect(mg); mg.connect(car.frequency);
+      car.connect(g); g.connect(A.master);
+      car.start(t); mod.start(t); car.stop(t + 0.35); mod.stop(t + 0.35);
+    }
+    // broken beat on a 16-step grid at 132 bpm: kicks land off the
+    // grid's safe spots, snares crack on 4 and 12, hats stutter.
+    var kickSteps = { 0: 1, 7: 1, 10: 1 };
+    var subSteps = { 0: 0, 3: 0, 10: 0, 12: 3, 14: 5 };
+    function scheduleStep(s, t) {
+      var bar16 = s % 64;
+      if (kickSteps[s % 16]) kick(t);
+      if (s % 16 === 4 || s % 16 === 12) snare(t);
+      if (s % 2 === 1 && ((s * 2654435761) >>> 8) % 5 !== 0) hat(t, s % 16 === 14);
+      if (subSteps[s % 16] !== undefined) {
+        sub(t, A.root * Math.pow(2, subSteps[s % 16] / 12), 0.34);
+      }
+      if ((s % 2 === 0 && ((s * 40503) >>> 4) % 7 < 3) || s % 16 === 11) {
+        pluck(t, A.melody[bar16]);
+      }
+    }
+    var stepDur = 60 / 132 / 4;
+    A.timer = setInterval(function() {
+      while (A.nextTime < ac.currentTime + 0.14) {
+        scheduleStep(A.step, A.nextTime);
+        A.nextTime += stepDur;
+        A.step++;
+      }
+    }, 27);
+    audio = A;
+    if (ac.resume) ac.resume();
+  } catch (e) {
+    audio = null;
+  }
+}
+
+function readSpec(t) {
+  if (audio && freqData) {
+    audio.analyser.getByteFrequencyData(freqData);
+    for (var i = 0; i < 128; i++) {
+      var bin = 2 + Math.floor(Math.pow(i / 127, 1.7) * 300);
+      spec[i] = freqData[bin] / 255;
+    }
+  } else {
+    demoSpec(t);
+  }
+}
+
+// ---------- projection + drawing ----------
+function project(rx, ry, d, scalePulse, cx, cy, R) {
+  var cxr = Math.cos(rx), sxr = Math.sin(rx), cyr = Math.cos(ry), syr = Math.sin(ry);
+  for (var i = 0; i < NV; i++) {
+    var r = 1 + d[i] * MAXD;
+    var x = verts[i * 3] * r, y = verts[i * 3 + 1] * r, z = verts[i * 3 + 2] * r;
+    var y1 = y * cxr - z * sxr, z1 = y * sxr + z * cxr;
+    var x2 = x * cyr + z1 * syr, z2 = -x * syr + z1 * cyr;
+    var persp = 3.4 / (3.4 - z2);
+    proj[i * 3] = cx + x2 * R * scalePulse * persp;
+    proj[i * 3 + 1] = cy + y1 * R * scalePulse * persp;
+    proj[i * 3 + 2] = persp;
+  }
+}
+function strokeShape(color, lw, dots) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = lw;
+  ctx.beginPath();
+  for (var e = 0; e < NE; e++) {
+    var u = edges[e][0] * 3, v = edges[e][1] * 3;
+    ctx.moveTo(proj[u], proj[u + 1]);
+    ctx.lineTo(proj[v], proj[v + 1]);
+  }
+  ctx.stroke();
+  if (dots) {
+    ctx.fillStyle = CYAN;
+    for (var i = 0; i < NV; i++) {
+      var p = proj[i * 3 + 2];
+      ctx.beginPath();
+      ctx.arc(proj[i * 3], proj[i * 3 + 1], Math.max(0.8, 2.1 * p), 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+var lastNow = null;
+function drawFrame(nowMs) {
+  var wh = viewportWH(), w = wh[0], h = wh[1];
+  var dpr = Math.min(window.devicePixelRatio || 1, 2);
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+
+  ctx.fillStyle = GROUND;
+  ctx.fillRect(0, 0, w, h);
+
+  var t = nowMs / 1000;
+  var dt = lastNow == null ? 0.016 : Math.min(0.05, (nowMs - lastNow) / 1000);
+  lastNow = nowMs;
+
+  readSpec(t);
+
+  // displacement: fast attack, slow release, so transients spike and
+  // pads stay smooth
+  for (var i = 0; i < NV; i++) {
+    var target = spec[vBin[i]];
+    var k = target > disp[i] ? 0.55 : 0.07;
+    disp[i] += (target - disp[i]) * k;
+  }
+  // beat pulse from the sub band
+  var bass = (spec[0] + spec[1] + spec[2] + spec[3] + spec[4] + spec[5]) / 6;
+  pulse += (bass - pulse) * (bass > pulse ? 0.5 : 0.06);
+  var scalePulse = 1 + pulse * 0.10;
+
+  // tumble: two slow axes always turning; drag adds torque, and on
+  // release the momentum decays over roughly four seconds
+  if (!dragging) {
+    rotX += velX; rotY += velY;
+    var decay = Math.exp(-dt / 1.3);
+    velX *= decay; velY *= decay;
+  }
+  var ax = rotX + t * 0.11, ay = rotY + t * 0.073;
+
+  // record the ghost snapshot for this frame
+  var slot = ghostRing[ghostHead];
+  slot.x = ax; slot.y = ay; slot.p = scalePulse;
+  slot.d.set(disp);
+  ghostHead = (ghostHead + 1) % GHOST_N;
+  if (ghostCount < GHOST_N) ghostCount++;
+
+  var cx = w / 2, cy = h * 0.54;
+  var R = Math.min(w, h) * 0.30;
+
+  // ghost first, behind: oldest snapshot at 60% scale, dim slate
+  if (ghostCount >= GHOST_N) {
+    var gs = ghostRing[ghostHead];
+    project(gs.x, gs.y, gs.d, gs.p, cx, cy, R * 0.6);
+    strokeShape(SLATE, Math.max(0.7, R * 0.006), false);
+  }
+  // main shape: magenta wireframe, cyan vertex dots
+  project(ax, ay, disp, scalePulse, cx, cy, R);
+  strokeShape(MAGENTA, Math.max(0.8, R * 0.008), true);
+  return {};
+}
+
+function loop(nowMs) {
+  drawFrame(nowMs);
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+}
+// pre-roll ~1.5s of state so the first painted frame already holds a
+// developed deformation and a full ghost trail behind the shape
+for (var pt = 4700; pt <= 6200; pt += 16.7) drawFrame(pt);
+if (typeof requestAnimationFrame === 'function') requestAnimationFrame(loop);
+
+// ---------- interaction ----------
+function findOverlay() {
+  try { return document.querySelector ? document.querySelector('#begin') : null; }
+  catch (e) { return null; }
+}
+function beginAudio() {
+  startAudio();
+  var ov = findOverlay();
+  if (ov) ov.className = 'gone';
+}
+function pointerPos(ev) {
+  var r = canvas.getBoundingClientRect ? canvas.getBoundingClientRect() : { left: 0, top: 0 };
+  return [ev.clientX - r.left, ev.clientY - r.top];
+}
+canvas.addEventListener('pointerdown', function(ev) {
+  beginAudio();
+  dragging = true;
+  var p = pointerPos(ev);
+  lastPX = p[0]; lastPY = p[1];
+  velX = 0; velY = 0;
+});
+canvas.addEventListener('pointermove', function(ev) {
+  if (!dragging) return;
+  var p = pointerPos(ev);
+  var dx = p[0] - lastPX, dy = p[1] - lastPY;
+  lastPX = p[0]; lastPY = p[1];
+  var dY = dx * 0.005, dX = dy * 0.005;
+  rotY += dY; rotX += dX;
+  velY = velY * 0.6 + dY * 0.4;
+  velX = velX * 0.6 + dX * 0.4;
+});
+function endDrag() { dragging = false; }
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
+var ovEl = findOverlay();
+if (ovEl && ovEl.addEventListener) ovEl.addEventListener('pointerdown', beginAudio);
+window.addEventListener('resize', function() { drawFrame(performance.now()); });
+if (window.visualViewport) window.visualViewport.addEventListener('resize', function() { drawFrame(performance.now()); });
+</script>
+</body>
+</html>
